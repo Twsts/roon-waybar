@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""
+Roon Waybar Daemon - monitors Roon playback and updates status file
+"""
+import json
+import signal
+import sys
+import time
+from pathlib import Path
+
+try:
+    from roonapi import RoonApi
+except ImportError:
+    print("ERROR: roonapi not installed. Install with: pip install roonapi", file=sys.stderr)
+    sys.exit(1)
+
+# Configuration
+STATE_FILE = Path.home() / ".cache" / "roon-status.json"
+CONFIG_FILE = Path.home() / ".config" / "roon-waybar" / "config.json"
+POLL_INTERVAL_SECONDS = 2
+
+# Ensure cache directory exists
+STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+# App info for Roon
+appinfo = {
+    "extension_id": "waybar_roon_monitor",
+    "display_name": "Waybar Roon Monitor",
+    "display_version": "1.1.0",
+    "publisher": "waybar-integration",
+    "email": "user@localhost",
+}
+
+# Global state
+roonapi = None
+zone_id = None
+should_exit = False
+last_status_json = None
+
+
+def signal_handler(signum, frame):
+    """Handle SIGTERM/SIGINT gracefully"""
+    global should_exit
+    should_exit = True
+    write_status("", "Roon daemon stopped", "idle")
+
+
+def write_status(text, tooltip, state="idle"):
+    """Write current status to JSON file for waybar (only when content changes)."""
+    global last_status_json
+
+    status = {
+        "text": text,
+        "tooltip": tooltip,
+        "class": state,
+    }
+
+    try:
+        serialized = json.dumps(status, ensure_ascii=False)
+        if serialized == last_status_json:
+            return
+
+        with open(STATE_FILE, "w") as f:
+            f.write(serialized)
+
+        last_status_json = serialized
+    except Exception as e:
+        print(f"Failed to write status: {e}", file=sys.stderr)
+
+
+def load_config():
+    """Load saved settings from config."""
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_config(config):
+    """Save settings to config."""
+    try:
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(config, f, indent=2)
+    except Exception as e:
+        print(f"Failed to save config: {e}", file=sys.stderr)
+
+
+def choose_zone(zones):
+    """Prefer the selected zone if valid, otherwise pick an active playing zone."""
+    global zone_id
+
+    if not zones:
+        return None
+
+    if zone_id in zones:
+        current = zones[zone_id]
+        if current.get("state") == "playing":
+            return current
+
+    # Prefer any playing zone to avoid stale zone_id after grouping/zone changes.
+    for zid, zone in zones.items():
+        if zone.get("state") == "playing":
+            zone_id = zid
+            return zone
+
+    if zone_id in zones:
+        return zones[zone_id]
+
+    # Fall back to first available zone.
+    zone_id = next(iter(zones))
+    return zones[zone_id]
+
+
+def persist_zone_selection(config, roon_ip, roon_port):
+    """Persist selected zone and connection details for next start."""
+    if not zone_id:
+        return
+    changed = False
+    if config.get("zone_id") != zone_id:
+        config["zone_id"] = zone_id
+        changed = True
+    if config.get("roon_ip") != roon_ip:
+        config["roon_ip"] = roon_ip
+        changed = True
+    if config.get("roon_port") != roon_port:
+        config["roon_port"] = roon_port
+        changed = True
+    if changed:
+        save_config(config)
+
+
+def render_status(config, roon_ip, roon_port):
+    """Render current zone state to Waybar cache file."""
+    global roonapi
+
+    try:
+        if not roonapi or not hasattr(roonapi, "zones"):
+            write_status("", "", "idle")
+            return
+
+        zones = roonapi.zones
+        if not zones:
+            write_status("", "", "idle")
+            return
+
+        zone = choose_zone(zones)
+        if not zone:
+            write_status("", "No zones found", "idle")
+            return
+
+        persist_zone_selection(config, roon_ip, roon_port)
+
+        now_playing = zone.get("now_playing")
+        state = zone.get("state", "unknown")
+
+        if not now_playing:
+            write_status("", f"Zone: {zone.get('display_name', 'Unknown')}\nNothing playing", "idle")
+            return
+
+        # Extract track info.
+        three_line = now_playing.get("three_line", {})
+        line1 = three_line.get("line1", "")  # Track title or station name
+        line2 = three_line.get("line2", "")  # Artist or "now playing"
+        line3 = three_line.get("line3", "")  # Album
+
+        if state == "playing":
+            if line2 and line1:
+                text = f" {line2} - {line1}"
+            elif line1:
+                text = f" {line1}"
+            elif line2:
+                text = f" {line2}"
+            else:
+                text = " Playing..."
+
+            tooltip_parts = []
+            if line1:
+                tooltip_parts.append(f"Track: {line1}")
+            if line2:
+                tooltip_parts.append(f"Artist: {line2}")
+            if line3:
+                tooltip_parts.append(f"Album: {line3}")
+
+            zone_name = zone.get("display_name", "Unknown")
+            tooltip_parts.append(f"Zone: {zone_name}")
+
+            outputs = zone.get("outputs", [])
+            if outputs:
+                volume_info = outputs[0].get("volume", {})
+                volume_value = volume_info.get("value")
+                is_muted = volume_info.get("is_muted", False)
+                if volume_value is not None:
+                    if is_muted:
+                        tooltip_parts.append(f"Volume: {volume_value} (muted)")
+                    else:
+                        tooltip_parts.append(f"Volume: {volume_value}")
+
+            tooltip = "\n".join(tooltip_parts)
+            state_class = "playing"
+        else:
+            text = ""
+            tooltip = ""
+            state_class = "paused" if state == "paused" else "idle"
+
+        write_status(text, tooltip, state_class)
+    except Exception as e:
+        print(f"ERROR in render_status: {e}", file=sys.stderr)
+        write_status("", "", "idle")
+
+
+def zone_callback(event, changed_ids, config, roon_ip, roon_port):
+    """Called when zone status changes."""
+    render_status(config, roon_ip, roon_port)
+
+
+def main():
+    """Main daemon loop."""
+    global roonapi, should_exit, zone_id
+
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
+    config = load_config()
+    zone_id = config.get("zone_id")
+
+    write_status("", "Searching for Roon Core...", "idle")
+
+    try:
+        # Get connection details from config or use defaults
+        roon_ip = config.get("roon_ip")
+        roon_port = config.get("roon_port", 9330)
+
+        if not roon_ip:
+            print("ERROR: No Roon Core IP configured.", file=sys.stderr)
+            print(f"Please edit {CONFIG_FILE} and add:", file=sys.stderr)
+            print('  {"roon_ip": "YOUR_ROON_CORE_IP", "roon_port": 9330}', file=sys.stderr)
+            write_status("", "Configure Roon IP in ~/.config/roon-waybar/config.json", "error")
+            return 1
+
+        print(f"Connecting to Roon Core at {roon_ip}:{roon_port}...")
+
+        token = config.get("token")
+        roonapi = RoonApi(appinfo, token, roon_ip, roon_port, blocking_init=False)
+
+        timeout = 30
+        for _ in range(timeout):
+            if should_exit:
+                return 0
+            if roonapi.token:
+                break
+            time.sleep(1)
+        else:
+            write_status("", "Timeout: Authorize in Roon Settings > Extensions", "error")
+            print("ERROR: Authorization timeout", file=sys.stderr)
+            return 1
+
+        if roonapi.token != token:
+            config["token"] = roonapi.token
+            save_config(config)
+
+        write_status("", "Connected to Roon", "idle")
+
+        # Register callback with bound parameters
+        roonapi.register_state_callback(
+            lambda event, changed_ids: zone_callback(event, changed_ids, config, roon_ip, roon_port)
+        )
+
+        # Initial render so module updates immediately after start.
+        render_status(config, roon_ip, roon_port)
+
+        last_poll = time.monotonic()
+        while not should_exit:
+            time.sleep(0.5)
+
+            # Event stream can occasionally miss meaningful updates while other clients are active.
+            # Polling keeps the status fresh even if callbacks are delayed.
+            if time.monotonic() - last_poll >= POLL_INTERVAL_SECONDS:
+                last_poll = time.monotonic()
+                render_status(config, roon_ip, roon_port)
+
+        write_status("", "", "idle")
+        return 0
+
+    except Exception as e:
+        write_status("", "", "idle")
+        print(f"ERROR: {e}", file=sys.stderr)
+        import traceback
+
+        traceback.print_exc()
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,12 @@
+#!/bin/bash
+# Waybar Roon module - shows currently playing track
+# Reads from status file updated by roon-waybar-daemon
+
+STATE_FILE="$HOME/.cache/roon-status.json"
+
+if [ -f "$STATE_FILE" ]; then
+    cat "$STATE_FILE"
+else
+    # No state file - daemon not running
+    echo '{"text":"","tooltip":"Roon daemon not running\nStart with: systemctl --user start roon-waybar","class":"error"}'
+fi
