@@ -4,10 +4,10 @@ A Waybar module that displays currently playing music from Roon.
 
 ## Features
 
-- 🎵 Shows "Artist - Track" in Waybar
-- 📊 Tooltip with Track, Artist, Album, Zone, and Volume info
-- 🔄 Auto-updates every 2 seconds + event-driven updates
-- 🎯 Click to open your favorite Roon TUI client
+-  Shows "Artist - Track" in Waybar
+-  Tooltip with Track, Artist, Album, Zone, and Volume info
+-  Auto-updates every 2 seconds + event-driven updates
+-  Click to open your favorite Roon TUI client
 
 ## Requirements
 
